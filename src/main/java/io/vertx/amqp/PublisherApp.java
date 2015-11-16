@@ -15,7 +15,7 @@ public class PublisherApp extends AbstractVerticle {
 
 	@Override
 	public void start() throws Exception {
-		vertx.setPeriodic(1000, v -> vertx.eventBus().publish(address, "hello world"));
+		vertx.setPeriodic(5000, v -> vertx.eventBus().publish(address, "hello world"));
 	}
 
 	public static void main(String[] args) {
