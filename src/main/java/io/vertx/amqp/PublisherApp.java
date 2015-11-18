@@ -1,5 +1,7 @@
 package io.vertx.amqp;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Vertx;
 
@@ -15,7 +17,8 @@ public class PublisherApp extends AbstractVerticle {
 
 	@Override
 	public void start() throws Exception {
-		vertx.setPeriodic(5000, v -> vertx.eventBus().publish(address, "hello world"));
+		final AtomicInteger counter = new AtomicInteger();
+		vertx.setPeriodic(5000, v -> vertx.eventBus().publish(address, "hello world - " + counter.incrementAndGet()));
 	}
 
 	public static void main(String[] args) {

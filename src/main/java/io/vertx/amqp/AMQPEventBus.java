@@ -20,6 +20,8 @@ import io.vertx.proton.ProtonClient;
 import io.vertx.proton.ProtonConnection;
 import io.vertx.proton.ProtonSender;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -31,7 +33,11 @@ public class AMQPEventBus implements EventBus, MetricsProvider {
 
 	protected final VertxInternal vertx;
 	protected final EventBusMetrics metrics;
-	protected final ConcurrentMap<String, AMQPMessageConsumer> receiverMap = new ConcurrentHashMap<String, AMQPMessageConsumer>();
+	protected final ConcurrentMap<String, AMQPMessageConsumer> unicastMap = new ConcurrentHashMap<String, AMQPMessageConsumer>();
+	protected final ConcurrentMap<String, AMQPMessageConsumer> multicastMap = new ConcurrentHashMap<String, AMQPMessageConsumer>();
+	protected final List<VertxConsumer> vertxConsumers = new ArrayList<VertxConsumer>();
+	protected final ConcurrentMap<String, VertxConsumer> vertxLocalConsumerMap = new ConcurrentHashMap<String, VertxConsumer>();
+	
 	protected final ConcurrentMap<String, ProtonSender> senderMap = new ConcurrentHashMap<String, ProtonSender>();
 	private ProtonClient client;
 	private MessageTranslator msgTranslator;
@@ -40,10 +46,11 @@ public class AMQPEventBus implements EventBus, MetricsProvider {
 	private AtomicInteger counter = new AtomicInteger();
 
 	// temp
-	int outboundPort = 5672;
-	String outboundHost = "localhost";
-	private String multicastPrefix = System.getProperty("vertx.multicast-prefix", "/topic/");
-	private String unicastPrefix = System.getProperty("vertx.unicast-prefix", "/queue/");
+	int outboundPort = Integer.getInteger("vertx.amqp.port", 5672);
+	String outboundHost = System.getProperty("vertx.amqp.host", "localhost");
+	
+	private String multicastPrefix = System.getProperty("vertx.multicast-prefix", "topic://");
+	private String unicastPrefix = System.getProperty("vertx.unicast-prefix", "queue://");
 
 	public AMQPEventBus(VertxInternal vertx) {
 		print("====================");
@@ -70,7 +77,10 @@ public class AMQPEventBus implements EventBus, MetricsProvider {
 			if (res.succeeded()) {
 				protonConnection = res.result();
 				protonConnection.open();
-				for (AMQPMessageConsumer cons : receiverMap.values()) {
+				for (AMQPMessageConsumer cons : unicastMap.values()) {
+					cons.setConnection(protonConnection);
+				}
+				for (AMQPMessageConsumer cons : multicastMap.values()) {
 					cons.setConnection(protonConnection);
 				}
 				started = true;
@@ -94,33 +104,27 @@ public class AMQPEventBus implements EventBus, MetricsProvider {
 	}
 
 	void addRegistration(String address, VertxConsumer cons) {
-		AMQPMessageConsumer amqpCons = null;
-		if (receiverMap.containsKey(address)){
-			amqpCons = receiverMap.get(address);
-			print("Reusing existing AMQP Consumer for address : " + address);
-		}else {
-			amqpCons = new AMQPMessageConsumer(vertx, this, address);
-			receiverMap.put(address, amqpCons);
-			print("Creating new AMQP Consumer for address : " + address);
-			if (started) {				
-				print("Connection is ready. Setting it");
-				amqpCons.setConnection(protonConnection);
-			}
-		}
-		amqpCons.addHandler(cons);		
+        if (cons.isLocal()){
+        	vertxLocalConsumerMap.put(address, cons);
+        }else {
+    		AMQPMessageConsumer unicastConsumer = new AMQPMessageConsumer(vertx, this, unicastPrefix+address, cons);
+    		unicastMap.put(cons.getID(), unicastConsumer);
+    		
+    		AMQPMessageConsumer multicastConsumer = new AMQPMessageConsumer(vertx, this, multicastPrefix+address, cons);
+    		multicastMap.put(cons.getID(), multicastConsumer);
+    		
+    		vertxConsumers.add(cons);
+        }
 	}
 
 	void removeRegistration(String address, VertxConsumer cons, Handler<AsyncResult<Void>> completionHandler) {
-		if (receiverMap.containsKey(address)){
-			AMQPMessageConsumer amqpCons = receiverMap.get(address);
-			amqpCons.removeHandler(cons);
-			if (amqpCons.vertxConsumerCount() == 0){
-				amqpCons.close();
-				receiverMap.remove(address);
-				print("No more vertx handlers for address '" + address + "' canceling AMQP subscription");
-			}
+		if (cons.isLocal()){
+			vertxLocalConsumerMap.remove(address);
+		}else {
+    		unicastMap.remove(cons.getID()).close();
+    		multicastMap.remove(cons.getID()).close();
+    		vertxConsumers.remove(cons);
 		}
-		// TODO completionHandler;
 	}
 
 	void unregisterAll() {
@@ -128,31 +132,40 @@ public class AMQPEventBus implements EventBus, MetricsProvider {
 			sender.close();
 		}
 
-		for (AMQPMessageConsumer reciever : receiverMap.values()) {
-			reciever.protocolReceiver().close();
+		for (String id : unicastMap.keySet()) {
+			unicastMap.get(id).close();
 		}
 
+		for (String id : multicastMap.keySet()) {
+			multicastMap.get(id).close();
+		}
+		
 		senderMap.clear();
-		receiverMap.clear();
+		unicastMap.clear();
+		multicastMap.clear();
+		vertxLocalConsumerMap.clear();
+		
+		//TODO enumerate all vertx consumers and run their close handlers.
+		
 		protonConnection.close();
 	}
 
 	@Override
 	public <T> MessageConsumer<T> consumer(String address) {
-		return createConsumer(address, null);
+		return createConsumer(address, null, false);
 	}
 
 	@Override
 	public <T> MessageConsumer<T> consumer(String address, Handler<Message<T>> handler) {
 		Objects.requireNonNull(handler, "handler");
-		return createConsumer(address, handler);
+		return createConsumer(address, handler, false);
 	}
 
-	<T> MessageConsumer<T> createConsumer(String address, Handler<Message<T>> handler) {
+	<T> MessageConsumer<T> createConsumer(String address, Handler<Message<T>> handler, boolean isLocal) {
 		checkStarted();
 		Objects.requireNonNull(address, "address");
 
-		VertxConsumer<T> cons = new VertxConsumer<T>(vertx, metrics, this, address, false, null, -1);
+		VertxConsumer<T> cons = new VertxConsumer<T>(vertx, metrics, this, address, false, null, -1, isLocal);
 		if (handler != null) {
 			cons.handler(handler);			
 		}
@@ -161,12 +174,12 @@ public class AMQPEventBus implements EventBus, MetricsProvider {
 
 	@Override
 	public <T> MessageConsumer<T> localConsumer(String address) {
-		return consumer(address);
+		return createConsumer(address, null, true);
 	}
 
 	@Override
 	public <T> MessageConsumer<T> localConsumer(String address, Handler<Message<T>> handler) {
-		return consumer(address, handler);
+		return createConsumer(address, handler, true);
 	}
 
 	@Override
@@ -176,7 +189,7 @@ public class AMQPEventBus implements EventBus, MetricsProvider {
 
 	@Override
 	public EventBus publish(String address, Object vertxMsg, DeliveryOptions options) {
-		String amqpAddress = topicPrefix + address;
+		String amqpAddress = multicastPrefix + address;
 		org.apache.qpid.proton.message.Message msg = msgTranslator.toAMQP(vertxMsg);
 		msg.setAddress(amqpAddress);
 		ProtonSender sender = null;
@@ -227,7 +240,7 @@ public class AMQPEventBus implements EventBus, MetricsProvider {
 
 	@Override
 	public EventBus send(String address, Object vertxMsg, DeliveryOptions options) {
-		String amqpAddress = sendPrefix + address;
+		String amqpAddress = unicastPrefix + address;
 		org.apache.qpid.proton.message.Message msg = msgTranslator.toAMQP(vertxMsg);
 		msg.setAddress(amqpAddress);
 		if (senderMap.containsKey(amqpAddress)) {
@@ -244,7 +257,7 @@ public class AMQPEventBus implements EventBus, MetricsProvider {
 	@Override
 	public <T> EventBus send(String address, Object vertxMsg, DeliveryOptions options,
 	        Handler<AsyncResult<Message<T>>> replyHandler) {
-		String amqpAddress = sendPrefix + address;
+		String amqpAddress = unicastPrefix + address;
 		org.apache.qpid.proton.message.Message msg = msgTranslator.toAMQP(vertxMsg);
 		msg.setAddress(amqpAddress);
 		ProtonSender sender = null;
@@ -299,10 +312,6 @@ public class AMQPEventBus implements EventBus, MetricsProvider {
 
 	MessageTranslator getMsgTranslator() {
 		return msgTranslator;
-	}
-
-	public String getPublishPrefix() {
-		return topicPrefix;
 	}
 	
 	static void print(String str){
